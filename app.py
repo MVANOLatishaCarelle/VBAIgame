@@ -1,24 +1,29 @@
 # Adventure Game
 import os
+import speech_recognition as sr
+import pyttsx3
+import threading
 
-import openai
-os.environ['SDL_VIDEO DRIVER'] = 'cocoa'  # Use native macOS window system
+# os.environ['SDL_VIDEODRIVER'] = 'cocoa'  # Use native macOS window system
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
-
 import pygame
+import pyaudio
 from pygame.locals import *
 from OpenGL.GL import *
 from OpenGL.GLU import *
 import math
-# import numpy as np
+import numpy as np
 import sys
-# import textwrap
+import asyncio
+import json
+import base64
+import websockets
+import tempfile
+import wave
+import textwrap
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
-import subprocess
-from typing import Optional, Dict, List
-import requests
 
 # Load environment variables
 load_dotenv()
@@ -30,12 +35,10 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 print("[OpenAI] API key loaded successfully.")
 
-# pygame.quit()
 # Initialize Pygame with macOS specific settings
 pygame.init()
-# display = (800, 600)
-WINDOW_WIDTH, WINDOW_HEIGHT = 512, 512  # Define first!
-display = (WINDOW_WIDTH, WINDOW_HEIGHT)  # Use variables
+WINDOW_WIDTH, WINDOW_HEIGHT = 512, 512
+display = (WINDOW_WIDTH, WINDOW_HEIGHT)
 pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
 pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
 pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
@@ -45,7 +48,7 @@ screen = pygame.display.get_surface()
 glEnable(GL_DEPTH_TEST)
 glMatrixMode(GL_PROJECTION)
 glLoadIdentity()
-gluPerspective(45, (display[0]/display[1]), 0.1, 50.0)
+gluPerspective(45, (display[0] / display[1]), 0.1, 50.0)
 glMatrixMode(GL_MODELVIEW)
 
 # Set up basic lighting
@@ -101,18 +104,19 @@ MENU_BG_COLOR = (0, 0, 0)  # Black background
 MENU_TEXT_COLOR = (0, 255, 0)  # Matrix-style green
 MENU_HIGHLIGHT_COLOR = (0, 200, 0)  # Slightly darker green for effects
 
+
 def draw_cube():
     vertices = [
         # Front face
-        [-0.5, -0.5,  0.5],
-        [ 0.5, -0.5,  0.5],
-        [ 0.5,  0.5,  0.5],
-        [-0.5,  0.5,  0.5],
+        [-0.5, -0.5, 0.5],
+        [0.5, -0.5, 0.5],
+        [0.5, 0.5, 0.5],
+        [-0.5, 0.5, 0.5],
         # Back face
         [-0.5, -0.5, -0.5],
-        [-0.5,  0.5, -0.5],
-        [ 0.5,  0.5, -0.5],
-        [ 0.5, -0.5, -0.5],
+        [-0.5, 0.5, -0.5],
+        [0.5, 0.5, -0.5],
+        [0.5, -0.5, -0.5],
     ]
 
     surfaces = [
@@ -131,6 +135,7 @@ def draw_cube():
             glVertex3fv(vertices[vertex])
     glEnd()
 
+
 def draw_sphere(radius, slices, stacks):
     for i in range(stacks):
         lat0 = math.pi * (-0.5 + float(i) / stacks)
@@ -144,53 +149,344 @@ def draw_sphere(radius, slices, stacks):
         glBegin(GL_QUAD_STRIP)
         for j in range(slices + 1):
             lng = 2 * math.pi * float(j) / slices
-            quad_x = math.cos(lng)
-            quad_y = math.sin(lng)
+            x = math.cos(lng)
+            y = math.sin(lng)
 
-            glNormal3f(quad_x * zr0, quad_y * zr0, z0)
-            glVertex3f(quad_x * zr0 * radius, quad_y * zr0 * radius, z0 * radius)
-            glNormal3f(quad_x * zr1, quad_y * zr1, z1)
-            glVertex3f(quad_x * zr1 * radius, quad_y * zr1 * radius, z1 * radius)
+            glNormal3f(x * zr0, y * zr0, z0)
+            glVertex3f(x * zr0 * radius, y * zr0 * radius, z0 * radius)
+            glNormal3f(x * zr1, y * zr1, z1)
+            glVertex3f(x * zr1 * radius, y * zr1 * radius, z1 * radius)
         glEnd()
+
 
 class DialogueSystem:
     def __init__(self):
+        # State management
         self.active = False
+        self.input_active = False
+        self.is_recording = False
+        self.is_processing = False
+        self.speech_thread = None
+        self.is_speaking = False
+        self.should_stop_speech = False
+
+        # Audio configuration with optimized settings
+        self.sample_rate = 16000
+        self.chunk_size = 512  # Reduced chunk size for lower latency
+        self.recording_duration = 3  # Reduced recording duration
+        self.recording_start_time = 0
+        self.audio_buffer = bytearray()
+        self.max_buffer_size = 8192  # Maximum buffer size
+
+        # WebSocket connection with state management
+        self.websocket = None
+        self.connection_task = None
+        self.connection_state = 'disconnected'
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
+
+        self.current_npc_role = "HR"  # Default voice
+
+        # Voice profiles configuration
+        self.npc_voices = {
+            "HR": {
+                "voice_id": "Microsoft Zira Desktop",  # Female
+                "speed": 1.0,  # Faster
+                "pitch": 100,  # Higher pitch
+                "volume": 0.6
+            },
+            "CEO": {
+                "voice_id": "Microsoft Hortense Desktop",  # Male
+                "speed": 0.8,  # Slower
+                "pitch": 80,  # Lower pitch
+                "volume": 0.6
+            }
+        }
+        self.init_tts_engine()  # Initialize with default voice
+
+        # Conversation management
+        # self.current_npc = None
+        self.initial_player_pos = None
+        self.conversation_history = []
+        self.npc_message = ""
         self.user_input = ""
+        self.last_response_time = 0
+        self.response_timeout = 5  # Maximum time to wait for response
+
+        # UI elements
         try:
             pygame.font.init()
             self.font = pygame.font.Font(None, 24)
             print("[DialogueSystem] Font loaded successfully")
         except Exception as e:
             print("[DialogueSystem] Font loading failed:", e)
-        self.npc_message = ""
-        self.input_active = False
-        self.last_npc_text = ""     # Track NPC text separately
-        self.last_input_text = ""   # Track input text separately
-        self.conversation_history = []  # Maintain conversation history
-        self.ollama_url = "http://localhost:11434/api/chat"  # Default Ollama API endpoint
 
-        # Create a surface for the UI
         self.ui_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA).convert_alpha()
         self.ui_texture = glGenTextures(1)
-        self.current_npc = None  # Track which NPC we're talking to
-        self.initial_player_pos = None  # Store initial position when dialogue starts
-        self._local_mode = True
 
-    def render_text(self, surface, text, top_left_x, top_left_y):
-        max_width = WINDOW_WIDTH - 40
+        # Initialize PyAudio with optimized settings
+        self.pyaudio = pyaudio.PyAudio()
+        self.stream = None
+
+    async def initialize(self):
+        """Initialize WebSocket connection"""
+        await self.connect_websocket()
+        return self
+
+    async def connect_websocket(self):
+        """Connect to our WebSocket proxy server with improved error handling"""
+        while self.reconnect_attempts < self.max_reconnect_attempts:
+            try:
+                self.websocket = await websockets.connect(
+                    "ws://localhost:8000/ws/transcribe",
+                    ping_interval=20,  # Keep connection alive
+                    ping_timeout=10,
+                    close_timeout=5
+                )
+                self.connection_state = 'connected'
+                self.reconnect_attempts = 0
+                print("[WebSocket] Connected to proxy server")
+                return True
+            except Exception as e:
+                print(f"[WebSocket] Connection failed: {e}")
+                self.reconnect_attempts += 1
+                await asyncio.sleep(1)  # Reduced retry delay
+        
+        self.connection_state = 'failed'
+        return False
+
+    def start_recording(self):
+        """Start recording audio and streaming to WebSocket"""
+        if self.is_recording:
+            return
+
+        self.is_recording = True
+        self.audio_buffer = bytearray()
+
+        # Open audio stream
+        self.stream = self.pyaudio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.sample_rate,
+            input=True,
+            frames_per_buffer=self.chunk_size,
+            stream_callback=self.audio_callback
+        )
+
+        print("Recording started...")
+
+    def stop_recording(self):
+        """Stop recording and process final audio"""
+        if not self.is_recording:
+            return
+
+        self.is_recording = False
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+
+        # Send remaining audio data
+        if self.websocket and self.audio_buffer:
+            asyncio.create_task(self.send_audio_data(bytes(self.audio_buffer)))
+            self.audio_buffer = bytearray()
+
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        """Callback for audio stream chunks"""
+        if self.is_recording:
+            self.audio_buffer.extend(in_data)
+            # Send chunks every 0.5 seconds of audio
+            if len(self.audio_buffer) >= self.sample_rate * 2:  # 2 seconds of audio
+                asyncio.create_task(self.send_audio_data(bytes(self.audio_buffer)))
+                self.audio_buffer = bytearray()
+        return (None, pyaudio.paContinue)
+
+    async def send_audio_data(self, audio_data):
+        """Send audio data through WebSocket"""
+        if self.websocket:
+            try:
+                await self.websocket.send(audio_data)
+            except Exception as e:
+                print(f"[WebSocket] Error sending audio: {e}")
+                await self.connect_websocket()  # Reconnect
+
+    async def receive_transcription(self):
+        """Receive transcription results from WebSocket"""
+        if not self.websocket:
+            return ""
+
+        try:
+            return await self.websocket.recv()
+        except Exception as e:
+            print(f"[WebSocket] Error receiving transcription: {e}")
+            return ""
+
+    async def record_and_transcribe_websocket(self):
+        """WebSocket-based recording and transcription"""
+        if self.is_recording:
+            return ""
+
+        self.is_recording = True
+        self.recording_start_time = time.time()
+
+        # Start recording
+        self.start_recording()
+
+        # Wait for recording to complete
+        while time.time() - self.recording_start_time < self.recording_duration:
+            await asyncio.sleep(0.1)
+
+        self.stop_recording()
+
+        # Get final transcription
+        return await self.receive_transcription()
+
+    def record_and_transcribe_google(self):
+        """Google speech recognition fallback"""
+        if self.is_recording:
+            return ""
+
+        self.is_recording = True
+        self.recording_start_time = time.time()
+
+        recognizer = sr.Recognizer()
+        mic = sr.Microphone()
+
+        try:
+            with mic as source:
+                print("Listening... (speak now)")
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = recognizer.listen(source, timeout=self.recording_duration)
+
+            text = recognizer.recognize_google(audio)
+            print("You said:", text)
+            return text
+        except sr.WaitTimeoutError:
+            print("Recording timed out")
+            return ""
+        except Exception as e:
+            print("Speech recognition failed:", e)
+            return ""
+        finally:
+            self.is_recording = False
+
+    async def record_and_transcribe(self):
+        """Main transcription method that tries WebSocket first, then falls back to Google"""
+        try:
+            # Try WebSocket method first
+            if self.websocket and self.websocket.open:
+                return await self.record_and_transcribe_websocket()
+        except Exception as e:
+            print(f"WebSocket transcription failed, falling back to Google: {e}")
+
+        # Fall back to Google speech recognition
+        return self.record_and_transcribe_google()
+
+    def init_tts_engine(self, npc_role=None):
+        """Initialize TTS with robust voice selection"""
+        try:
+            if npc_role:
+                self.current_npc_role = npc_role
+
+            voice_settings = self.npc_voices.get(self.current_npc_role, {})
+
+            # Cleanup existing engine
+            if self.engine:
+                self.engine.stop()
+                del self.engine
+
+            # Initialize new engine
+            self.engine = pyttsx3.init()
+
+            # Apply base properties
+            self.engine.setProperty('rate', 175 * voice_settings.get("speed", 1.0))
+            self.engine.setProperty('volume', voice_settings.get("volume", 1.0))
+
+            # Voice selection with exact matching
+            if 'voice_id' in voice_settings:
+                voices = self.engine.getProperty('voices')
+                target_voice = None
+
+                # Try to find a voice that matches "alloy" or "ballad" (adjust logic as needed)
+                for voice in voices:
+                    if voice_settings["voice_id"].lower() in voice.name.lower():
+                        target_voice = voice
+                        break
+
+                if target_voice:
+                    self.engine.setProperty('voice', target_voice.id)
+                    print(f"\n[VOICE] Successfully set {self.current_npc_role} voice to: {target_voice.name}")
+                else:
+                    print(
+                        f"\n[WARNING] Could not find voice '{voice_settings['voice_id']}' for {self.current_npc_role}")
+
+            # Pitch adjustment (may not work on all systems)
+            try:
+                if 'pitch' in voice_settings:
+                    self.engine.setProperty('pitch', voice_settings["pitch"] / 100)
+            except Exception as e:
+                print(f"[PITCH] Adjustment not supported: {e}")
+
+        except Exception as e:
+            print(f"[TTS ERROR] Initialization failed: {e}")
+            self.engine = None
+
+    def stop_speech(self):
+        """Stop any ongoing speech"""
+        self.should_stop_speech = True
+        try:
+            if self.engine:
+                self.engine.stop()
+            if self.speech_thread and self.speech_thread.is_alive():
+                self.speech_thread.join(timeout=0.1)
+        except Exception as e:
+            print(f"[DialogueSystem] Error stopping speech: {e}")
+        finally:
+            self.should_stop_speech = False
+            self.is_speaking = False
+
+    def _speak_thread(self, text):
+        """Internal thread function for speech synthesis"""
+        try:
+            if self.engine:
+                self.engine.say(text)
+                self.engine.runAndWait()
+        except Exception as e:
+            print(f"[DialogueSystem] Speech error in thread: {e}")
+        finally:
+            self.is_speaking = False
+
+    def speak(self, text):
+        """Speak text using the current NPC's voice"""
+        if not hasattr(self, 'speech_thread'):
+            self.speech_thread = None
+
+        # Stop any ongoing speech
+        self.stop_speech()
+
+        # Initialize TTS with current NPC's voice
+        self.init_tts_engine(self.current_npc_role)
+
+        # Start new speech thread
+        self.speech_thread = threading.Thread(
+            target=self._speak_thread,
+            args=(text,),
+            daemon=True
+        )
+        self.speech_thread.start()
+
+    def render_text(self, surface, text, x, y):
+        """Render text with word wrapping and scrolling for long messages"""
+        max_width = WINDOW_WIDTH - 80  # Increased margin for better readability
         line_height = 25
-
+        max_lines = 6  # Maximum number of lines to show at once
         words = text.split()
         lines = []
         current_line = []
         current_width = 0
 
-        # Always use pure white with full opacity
-        text_color = (255, 255, 255)
-
+        # Word wrapping
         for word in words:
-            word_surface = self.font.render(word + ' ', True, text_color)
+            word_surface = self.font.render(word + ' ', True, (255, 255, 255))
             word_width = word_surface.get_width()
 
             if current_width + word_width <= max_width:
@@ -204,194 +500,72 @@ class DialogueSystem:
         if current_line:
             lines.append(' '.join(current_line))
 
-        # Render each line in pure white
+        # Calculate total height needed
+        total_height = len(lines) * line_height
+
+        # If text is too long, add a scroll indicator
+        if len(lines) > max_lines:
+            # Show the last 'max_lines' lines
+            lines = lines[-max_lines:]
+            # Add scroll indicator
+            scroll_text = "... (scroll up to see more)"
+            scroll_surface = self.font.render(scroll_text, True, (200, 200, 200))
+            surface.blit(scroll_surface, (x, y - line_height))
+
+        # Render each line
         for i, line in enumerate(lines):
-            text_surface = self.font.render(line, True, (255, 255, 255))  # Force white color
-            surface.blit(text_surface, (top_left_x, top_left_y + i * line_height))
+            text_surface = self.font.render(line, True, (255, 255, 255))
+            surface.blit(text_surface, (x, y + i * line_height))
 
         return len(lines) * line_height
 
     def start_conversation(self, npc_role="HR", player_pos=None):
         self.active = True
         self.input_active = True
-        self.current_npc = npc_role
-        # Store player's position when starting conversation
+        self.current_npc = npc_role  # This sets the active NPC
         self.initial_player_pos = [player_pos[0], player_pos[1], player_pos[2]] if player_pos else [0, 0.5, 0]
         print(f"[DialogueSystem] Dialogue started with {npc_role}")
 
-        # Base personality framework for consistent behavior
-        base_prompt = """Interaction Framework:
-            - Maintain consistent personality throughout conversation
-            - Remember previous context within the dialogue
-            - Use natural speech patterns with occasional filler words
-            - Show emotional intelligence in responses
-            - Keep responses concise but meaningful (2-3 sentences)
-            - React appropriately to both positive and negative interactions
-            """
-
-        if npc_role == "HR":
-            system_prompt = f"""{base_prompt}
-                You are Sarah Chen, HR Director at Venture Builder AI. Core traits:
-
-                PERSONALITY:
-                - Warm but professional demeanor
-                - Excellent emotional intelligence
-                - Strong ethical boundaries
-                - Protective of confidential information
-                - Quick to offer practical solutions
-
-                BACKGROUND:
-                - 15 years HR experience in tech
-                - Masters in Organizational Psychology
-                - Certified in Conflict Resolution
-                - Known for fair handling of sensitive issues
-
-                SPEAKING STYLE:
-                - Uses supportive language: "I understand that..." "Let's explore..."
-                - References policies with context: "According to our wellness policy..."
-                - Balances empathy with professionalism
-
-                CURRENT COMPANY INITIATIVES:
-                - AI Talent Development Program
-                - Global Remote Work Framework
-                - Venture Studio Culture Development
-                - Innovation Leadership Track
-
-                BEHAVIORAL GUIDELINES:
-                - Never disclose confidential information
-                - Always offer clear next steps
-                - Maintain professional boundaries
-                - Document sensitive conversations
-                - Escalate serious concerns appropriately"""
-
-        else:  # CEO
-            system_prompt = f"""{base_prompt}
-                You are Michael Chen, CEO of Venture Builder AI. Core traits:
-
-                PERSONALITY:
-                - Visionary yet approachable
-                - Strategic thinker
-                - Passionate about venture building
-                - Values transparency
-                - Leads by example
-
-                BACKGROUND:
-                - Founded Venture Builder AI 5 years ago
-                - Successfully launched 15+ venture-backed startups
-                - MIT Computer Science graduate
-                - Pioneer in AI-powered venture building
-
-                SPEAKING STYLE:
-                - Uses storytelling: "When we launched our first venture..."
-                - References data: "Our portfolio metrics show..."
-                - Balances optimism with realism
-
-                KEY FOCUSES:
-                - AI-powered venture creation
-                - Portfolio company growth
-                - Startup ecosystem development
-                - Global venture studio expansion
-
-                CURRENT INITIATIVES:
-                - AI Venture Studio Framework
-                - European Market Entry
-                - Startup Success Methodology
-                - Founder-in-Residence Program
-
-                BEHAVIORAL GUIDELINES:
-                - Share venture building vision
-                - Highlight portfolio successes
-                - Address startup challenges
-                - Maintain investor confidence
-                - Balance transparency with discretion"""
-
-        # Fix the initial message to be from the NPC to the user
+        # Initial greeting
         initial_message = {
             "HR": "Hello! I'm Sarah, the HR Director at Venture Builder AI. How can I assist you today?",
             "CEO": "Hello! I'm Michael, the CEO of Venture Builder AI. What can I do for you today?"
         }
 
-
         self.npc_message = initial_message[npc_role]
 
-        # Initialize conversation history with system prompt only
+        # Initialize conversation history
         self.conversation_history = [{
             "role": "system",
-            "content": system_prompt
-        }, {
-            "role": "assistant",
-            "content": initial_message[npc_role]
+            "content": f"You are {npc_role} at Venture Builder AI. Keep responses concise and natural."
         }]
 
-        print(f"[DialogueSystem] Dialogue started with {npc_role}")
-
-    def send_message(self):
-        if not self.conversation_history:
-            print("[DialogueSystem] No conversation history to send.")
+    async def handle_input(self, event):
+        if not self.active or not self.input_active:
             return
 
-        try:
-            # Prepare messages for Ollama (skip the system prompt in the messages)
-            messages = [
-                {"role": msg["role"], "content": msg["content"]}
-                for msg in self.conversation_history
-                if msg["role"] != "system"
-            ]
+        if event.type == pygame.KEYDOWN:
+            keys = pygame.key.get_pressed()
 
-            # Add the system prompt as part of the request options
-            system_prompt = next(
-                (msg["content"] for msg in self.conversation_history if msg["role"] == "system"),
-                ""
-            )
+            if keys[pygame.K_LSHIFT] and event.key == pygame.K_q:
+                self.stop_speech()
+                self.stop_recording()  # Stop any ongoing recording
+                self.active = False
+                self.input_active = False
+                print("[DialogueSystem] Chat ended")
+                return {"command": "move_player_back", "position": self.initial_player_pos}
 
-            payload = {
-                "model": "llama3",  # or any other model you have installed
-                "messages": messages,
-                "options": {
-                    "system": system_prompt,
-                    "temperature": 0.85,
-                    "max_tokens": 150,
-                    "top_p": 0.95,
-                    "frequency_penalty": 0.2,
-                    "presence_penalty": 0.1
-                },
-                "stream": False
-            }
-
-            response = requests.post(
-                self.ollama_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30  # 30-second timeout
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"Ollama API error: {response.text}")
-
-            ai_response = response.json()
-            ai_message = ai_response["message"]["content"]
-            self._update_conversation(ai_message)
-            print(f"[DialogueSystem] NPC says: {ai_message}")
-
-        except requests.exceptions.RequestException as e:
-            self._handle_api_error(f"Connection error: {str(e)}")
-        except Exception as e:
-            self._handle_api_error(f"Unexpected error: {str(e)}")
-
-    def _update_conversation(self, message):
-        """Helper to store messages with consistent formatting"""
-        self.conversation_history.append({
-            "role": "assistant",
-            "content": message
-        })
-        self.npc_message = message
-
-    def _handle_api_error(self, error_msg):
-        """Centralized error handling"""
-        print(f"[DialogueSystem] Error: {error_msg}")
-        self.npc_message = "I'm having technical difficulties. Please try again later."
+            if event.key == pygame.K_LALT and not self.is_recording and not self.is_processing:
+                self.stop_speech()
+                self.user_input = ""  # Clear previous input
+                spoken_text = await self.record_and_transcribe()  # Now async
+                if spoken_text:
+                    self.user_input = spoken_text
+                    self.conversation_history.append({"role": "user", "content": spoken_text})
+                    await self.send_message()
 
     def render(self):
+        """Render the dialogue UI"""
         if not self.active:
             return
 
@@ -401,23 +575,36 @@ class DialogueSystem:
             box_height = 200
             box_y = WINDOW_HEIGHT - box_height - 20
 
-            # Make the background MUCH darker - almost black with some transparency
-            box_color = (0, 0, 0, 230)  # Changed to very dark, mostly opaque background
+            # Background
+            box_color = (0, 0, 0, 230)
             pygame.draw.rect(self.ui_surface, box_color, (20, box_y, WINDOW_WIDTH - 40, box_height))
-
-            # White border
             pygame.draw.rect(self.ui_surface, (255, 255, 255, 255), (20, box_y, WINDOW_WIDTH - 40, box_height), 2)
 
-            # Render ALL text in pure white (255, 255, 255)
-            # Quit instruction
-            quit_text_surface = self.font.render("Press Shift+Q to exit", True, (255, 255, 255))
-            self.ui_surface.blit(quit_text_surface, (40, box_y + 10))
+            # Status indicators
+            status_y = box_y + 10
+            if self.is_recording:
+                elapsed = time.time() - self.recording_start_time
+                remaining = max(0, self.recording_duration - elapsed)
+                status_text = f"Recording... {remaining:.1f}s"
+                status_color = (255, 0, 0)  # Red for recording
+            elif self.is_processing:
+                status_text = "Processing..."
+                status_color = (255, 255, 0)  # Yellow for processing
+            elif self.is_speaking:
+                status_text = "NPC speaking... (Press R or Enter to interrupt)"
+                status_color = (0, 255, 0)  # Green for speaking
+            else:
+                status_text = "Press Alt to speak, Shift+Q to exit"
+                status_color = (255, 255, 255)  # White for normal
 
-            # NPC message in white
+            status_surface = self.font.render(status_text, True, status_color)
+            self.ui_surface.blit(status_surface, (40, status_y))
+
+            # NPC message
             if self.npc_message:
                 self.render_text(self.ui_surface, self.npc_message, 40, box_y + 40)
 
-            # Input prompt in white
+            # Input prompt
             if self.input_active:
                 input_prompt = "> " + self.user_input + "_"
                 input_surface = self.font.render(input_prompt, True, (255, 255, 255))
@@ -450,10 +637,14 @@ class DialogueSystem:
 
         # Draw the UI texture
         glBegin(GL_QUADS)
-        glTexCoord2f(0, 0); glVertex2f(0, 0)
-        glTexCoord2f(1, 0); glVertex2f(WINDOW_WIDTH, 0)
-        glTexCoord2f(1, 1); glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT)
-        glTexCoord2f(0, 1); glVertex2f(0, WINDOW_HEIGHT)
+        glTexCoord2f(0, 0);
+        glVertex2f(0, 0)
+        glTexCoord2f(1, 0);
+        glVertex2f(WINDOW_WIDTH, 0)
+        glTexCoord2f(1, 1);
+        glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT)
+        glTexCoord2f(0, 1);
+        glVertex2f(0, WINDOW_HEIGHT)
         glEnd()
 
         # Restore OpenGL state
@@ -463,35 +654,53 @@ class DialogueSystem:
         glPopMatrix()
         glPopAttrib()
 
-    def handle_input(self, event):
-        if not self.active or not self.input_active:
+    async def send_message(self):
+        """Send message to AI and get response with timeout handling"""
+        if not self.conversation_history:
+            print("[DialogueSystem] No conversation history to send.")
             return
 
-        if event.type == pygame.KEYDOWN:
-            # Check for Shift+Q to exit chat
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_LSHIFT] and event.key == pygame.K_q:
-                self.active = False
-                self.input_active = False
-                print("[DialogueSystem] Chat ended")
-                # Return both the command and the initial position
-                return {"command": "move_player_back", "position": self.initial_player_pos}
+        self.is_processing = True
+        self.last_response_time = time.time()
 
-            if event.key == pygame.K_RETURN and self.user_input.strip():
-                print(f"[DialogueSystem] User said: {self.user_input}")
+        try:
+            response = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: client.chat.completions.create(
+                        model="gpt-4-0125-preview",
+                        messages=self.conversation_history,
+                        temperature=0.85,
+                        max_tokens=100,
+                        response_format={"type": "text"},
+                        top_p=0.95,
+                        frequency_penalty=0.2,
+                        presence_penalty=0.1
+                    )
+                ),
+                timeout=self.response_timeout
+            )
 
-                # Add user message to conversation history
-                self.conversation_history.append({"role": "user", "content": self.user_input.strip()})
+            ai_message = response.choices[0].message.content
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": ai_message
+            })
 
-                # Clear user input
-                self.user_input = ""
+            self.npc_message = ai_message
+            print(f"[DialogueSystem] {self.current_npc_role} says: {ai_message}")
 
-                # Send message to AI
-                self.send_message()
-            elif event.key == pygame.K_BACKSPACE:
-                self.user_input = self.user_input[:-1]
-            elif event.unicode.isprintable():
-                self.user_input += event.unicode
+            # Speak the response using current NPC's voice
+            self.speak(ai_message)
+
+        except asyncio.TimeoutError:
+            print("[DialogueSystem] Response timeout")
+            self.npc_message = "I apologize, but I'm taking too long to respond. Please try again."
+        except Exception as e:
+            print(f"[DialogueSystem] Error in send_message: {e}")
+            self.npc_message = "I apologize, but I'm having trouble connecting to our systems right now."
+        finally:
+            self.is_processing = False
 
 class World:
     def __init__(self):
@@ -507,9 +716,9 @@ class World:
             'partition': (0.3, 0.3, 0.3)  # Darker solid gray for booth walls
         }
 
-    def draw_desk(self, desk_position_x, desk_position_z, rotation=0):
+    def draw_desk(self, x, z, rotation=0):
         glPushMatrix()
-        glTranslatef(desk_position_x, 0, desk_position_z)  # Start at floor level
+        glTranslatef(x, 0, z)  # Start at floor level
         glRotatef(rotation, 0, 1, 0)
 
         # Desk top (reduced size)
@@ -524,10 +733,10 @@ class World:
         # Desk legs (adjusted for new height)
         for x_offset, z_offset in [(-0.35, -0.25), (0.35, -0.25), (-0.35, 0.25), (0.35, 0.25)]:
             glBegin(GL_QUADS)
-            glVertex3f(x_offset-0.02, 0, z_offset-0.02)
-            glVertex3f(x_offset+0.02, 0, z_offset-0.02)
-            glVertex3f(x_offset+0.02, 0.4, z_offset-0.02)
-            glVertex3f(x_offset-0.02, 0.4, z_offset-0.02)
+            glVertex3f(x_offset - 0.02, 0, z_offset - 0.02)
+            glVertex3f(x_offset + 0.02, 0, z_offset - 0.02)
+            glVertex3f(x_offset + 0.02, 0.4, z_offset - 0.02)
+            glVertex3f(x_offset - 0.02, 0.4, z_offset - 0.02)
             glEnd()
 
         # Computer monitor (smaller)
@@ -542,9 +751,9 @@ class World:
 
         glPopMatrix()
 
-    def draw_chair(self, chair_position_x, chair_position_z, rotation=0):
+    def draw_chair(self, x, z, rotation=0):
         glPushMatrix()
-        glTranslatef(chair_position_x, 0, chair_position_z)
+        glTranslatef(x, 0, z)
         glRotatef(rotation, 0, 1, 0)
         glColor3f(*self.colors['chair'])
 
@@ -567,17 +776,17 @@ class World:
         # Chair legs (adjusted height)
         for x_offset, z_offset in [(-0.12, -0.12), (0.12, -0.12), (-0.12, 0.12), (0.12, 0.12)]:
             glBegin(GL_QUADS)
-            glVertex3f(x_offset-0.02, 0, z_offset-0.02)
-            glVertex3f(x_offset+0.02, 0, z_offset-0.02)
-            glVertex3f(x_offset+0.02, 0.25, z_offset-0.02)
-            glVertex3f(x_offset-0.02, 0.25, z_offset-0.02)
+            glVertex3f(x_offset - 0.02, 0, z_offset - 0.02)
+            glVertex3f(x_offset + 0.02, 0, z_offset - 0.02)
+            glVertex3f(x_offset + 0.02, 0.25, z_offset - 0.02)
+            glVertex3f(x_offset - 0.02, 0.25, z_offset - 0.02)
             glEnd()
 
         glPopMatrix()
 
-    def draw_plant(self, plant_position_x, plant_position_z):
+    def draw_plant(self, x, z):
         glPushMatrix()
-        glTranslatef(plant_position_x, 0, plant_position_z)
+        glTranslatef(x, 0, z)
 
         # Plant pot (smaller)
         glColor3f(0.4, 0.2, 0.1)  # Brown pot
@@ -607,12 +816,12 @@ class World:
         num_leaves = 6
         for i in range(num_leaves):
             angle = (i / num_leaves) * 2 * math.pi
-            leaf_position_x = math.cos(angle) * leaf_size
-            leaf_position_z = math.sin(angle) * leaf_size
+            x = math.cos(angle) * leaf_size
+            z = math.sin(angle) * leaf_size
             glBegin(GL_TRIANGLES)
             glVertex3f(0, 0, 0)
-            glVertex3f(leaf_position_x, leaf_size, leaf_position_z)
-            glVertex3f(leaf_position_z, leaf_size/2, -leaf_position_x)
+            glVertex3f(x, leaf_size, z)
+            glVertex3f(z, leaf_size / 2, -x)
             glEnd()
 
         glPopMatrix()
@@ -665,12 +874,12 @@ class World:
         # HR Area (left side)
         self.draw_desk(-4, -2, 90)
         self.draw_chair(-3.5, -2, 90)
-        World.draw_partition_walls(-4, -2)  # Add booth walls for HR
+        self.draw_partition_walls(-4, -2)  # Add booth walls for HR
 
         # CEO Area (right side)
         self.draw_desk(4, 1, -90)
         self.draw_chair(3.5, 1, -90)
-        World.draw_partition_walls(4, 1)  # Add booth walls for CEO
+        self.draw_partition_walls(4, 1)  # Add booth walls for CEO
 
         # Plants in corners (moved closer to walls)
         self.draw_plant(-4.5, -4.5)
@@ -678,25 +887,25 @@ class World:
         self.draw_plant(-4.5, 4.5)
         self.draw_plant(4.5, 4.5)
 
-    @staticmethod
-    def draw_partition_walls(wall_position_x, wall_position_z):
+    def draw_partition_walls(self, x, z):
         """Draw booth partition walls - all surfaces in solid gray"""
         glColor3f(0.3, 0.3, 0.3)  # Solid gray for all walls
 
         # Back wall (smaller and thinner)
         glPushMatrix()
-        glTranslatef(wall_position_x, 0, wall_position_z)
+        glTranslatef(x, 0, z)
         glScalef(0.05, 1.0, 1.0)  # Thinner wall, normal height, shorter length
         draw_cube()  # Replace glutSolidCube with draw_cube
         glPopMatrix()
 
         # Side wall (smaller and thinner)
         glPushMatrix()
-        glTranslatef(wall_position_x, 0, wall_position_z + 0.5)  # Moved closer
+        glTranslatef(x, 0, z + 0.5)  # Moved closer
         glRotatef(90, 0, 1, 0)
         glScalef(0.05, 1.0, 0.8)  # Thinner wall, normal height, shorter length
         draw_cube()  # Replace glutSolidCube with draw_cube
         glPopMatrix()
+
 
 class Player:
     def __init__(self):
@@ -724,16 +933,17 @@ class Player:
         if abs(new_z) < room_limit:
             self.pos[2] = new_z
 
-    def update_rotation(self, dx):
+    def update_rotation(self, dx, dy):
         # Multiply mouse movement by sensitivity for faster turning
         self.rot[1] += dx * self.mouse_sensitivity
 
+
 class NPC:
-    def __init__(self, npc_x, npc_z, role="HR"):
+    def __init__(self, x, y, z, role="HR"):
         self.scale = 0.6  # Make NPCs smaller (about 60% of current size)
         # Position them beside the desks, at ground level
         # Adjust Y position to be half their height (accounting for scale)
-        self.pos = [npc_x, 0.65, npc_z]  # This puts their feet on the ground
+        self.pos = [x, 0.65, z]  # This puts their feet on the ground
         self.size = 0.5
         self.role = role
 
@@ -743,10 +953,10 @@ class NPC:
 
         # Updated clothing colors
         if role == "HR":
-            self.clothes_primary = (0.8, 0.2, 0.2)    # Bright red
-            self.clothes_secondary = (0.6, 0.15, 0.15) # Darker red
+            self.clothes_primary = (0.8, 0.2, 0.2)  # Bright red
+            self.clothes_secondary = (0.6, 0.15, 0.15)  # Darker red
         else:  # CEO
-            self.clothes_primary = (0.2, 0.3, 0.8)    # Bright blue
+            self.clothes_primary = (0.2, 0.3, 0.8)  # Bright blue
             self.clothes_secondary = (0.15, 0.2, 0.6)  # Darker blue
 
     def draw(self):
@@ -769,7 +979,7 @@ class NPC:
         glColor3f(*self.clothes_primary)
         glPushMatrix()
         glTranslatef(0, -0.3, 0)  # Move down from head
-        glScalef(0.3, 0.4, 0.2)   # Make it rectangular
+        glScalef(0.3, 0.4, 0.2)  # Make it rectangular
         draw_cube()
         glPopMatrix()
 
@@ -793,6 +1003,7 @@ class NPC:
 
         glPopMatrix()
 
+
 class MenuScreen:
     def __init__(self):
         self.font_large = pygame.font.Font(None, 74)
@@ -806,7 +1017,6 @@ class MenuScreen:
 
         # Create a surface for 2D rendering
         surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        surface.fill((0, 0, 0, 0))
 
         # Calculate vertical positions
         center_y = WINDOW_HEIGHT // 2
@@ -816,7 +1026,7 @@ class MenuScreen:
 
         # Render title with "typing" effect
         elapsed_time = time.time() - self.start_time
-        title_chars = min(len(TITLE), int(elapsed_time * 15))  # Type 15 chars per second
+        title_chars = int(min(len(TITLE), elapsed_time * 15))  # Type 15 chars per second
         partial_title = TITLE[:title_chars]
         title_surface = self.font_large.render(partial_title, True, MENU_TEXT_COLOR)
         title_x = (WINDOW_WIDTH - title_surface.get_width()) // 2
@@ -838,8 +1048,9 @@ class MenuScreen:
                 prompt_x = (WINDOW_WIDTH - prompt_surface.get_width()) // 2
                 surface.blit(prompt_surface, (prompt_x, prompt_y))
 
+        # Add some retro effects (scanlines)
         for y in range(0, WINDOW_HEIGHT, 4):
-            pygame.draw.line(surface, (0, 50, 0, 255), (0, y), (WINDOW_WIDTH, y))
+            pygame.draw.line(surface, (0, 50, 0), (0, y), (WINDOW_WIDTH, y))
 
         # Convert surface to OpenGL texture
         texture_data = pygame.image.tostring(surface, "RGBA", True)
@@ -854,19 +1065,21 @@ class MenuScreen:
         # Render the texture in OpenGL
         texture = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, texture)
-
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
 
         # Draw the texture
         glEnable(GL_TEXTURE_2D)
         glBegin(GL_QUADS)
-        glTexCoord2f(0, 1); glVertex2f(0, 0)
-        glTexCoord2f(1, 1); glVertex2f(WINDOW_WIDTH, 0)
-        glTexCoord2f(1, 0); glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT)
-        glTexCoord2f(0, 0); glVertex2f(0, WINDOW_HEIGHT)
+        glTexCoord2f(0, 1);
+        glVertex2f(0, 0)
+        glTexCoord2f(1, 1);
+        glVertex2f(WINDOW_WIDTH, 0)
+        glTexCoord2f(1, 0);
+        glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT)
+        glTexCoord2f(0, 0);
+        glVertex2f(0, WINDOW_HEIGHT)
         glEnd()
         glDisable(GL_TEXTURE_2D)
 
@@ -880,6 +1093,7 @@ class MenuScreen:
 
         pygame.display.flip()
 
+
 # Modify the Game3D class to include the menu
 class Game3D:
     def __init__(self):
@@ -887,10 +1101,17 @@ class Game3D:
         self.player = Player()
         self.world = World()
         self.dialogue = DialogueSystem()
-        self.hr_npc = NPC(-3.3, -2, "HR")  # Moved beside the desk
-        self.ceo_npc = NPC(3.3, 1, "CEO")  # Moved beside the desk
+        self.hr_npc = NPC(-3.3, 0, -2, "HR")
+        self.ceo_npc = NPC(3.3, 0, 1, "CEO")
         self.interaction_distance = 2.0
         self.last_interaction_time = 0
+        self.loop = asyncio.get_event_loop()
+        self.running = True
+
+    async def initialize(self):
+        """Async initialization"""
+        await self.dialogue.initialize()
+        return self
 
     def move_player_away_from_npc(self, npc_pos):
         # Calculate direction vector from NPC to player
@@ -898,7 +1119,7 @@ class Game3D:
         dz = self.player.pos[2] - npc_pos[2]
 
         # Normalize the vector
-        distance = math.sqrt(dx*dx + dz*dz)
+        distance = math.sqrt(dx * dx + dz * dz)
         if distance > 0:
             dx /= distance
             dz /= distance
@@ -907,79 +1128,112 @@ class Game3D:
         self.player.pos[0] = npc_pos[0] + (dx * 3)
         self.player.pos[2] = npc_pos[2] + (dz * 3)
 
-    def run(self):
-        running = True
-        while running:
+    async def run_async(self):
+        await self.initialize()
+        while self.running:
             if self.menu.active:
+                # Menu loop
                 for event in pygame.event.get():
-                    if event.type == pygame.QUIT: running = False
-                    if event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE: running = False
-                        if (event.key == pygame.K_RETURN and
-                                time.time() - self.menu.start_time > (len(TITLE) / 15 + 1)):
+                    if event.type == pygame.QUIT:
+                        self.running = False
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_RETURN and time.time() - self.menu.start_time > (len(TITLE) / 15 + 1):
                             self.menu.active = False
                             pygame.mouse.set_visible(False)
                             pygame.event.set_grab(True)
+                        elif event.key == pygame.K_ESCAPE:
+                            self.running = False
+
                 self.menu.render()
             else:
+                # Main game loop
                 for event in pygame.event.get():
-                    if event.type == pygame.QUIT: running = False
-                    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                        if self.dialogue.active:
-                            self.dialogue.active = False
-                            pygame.mouse.set_visible(False)
-                        else:
-                            running = False
-                    if event.type == pygame.KEYDOWN and event.key == pygame.K_e and not self.dialogue.active:
-                        self.check_npc_interactions(manual_trigger=True)
-                    if self.dialogue.active and (result := self.dialogue.handle_input(event)) and result.get(
-                            "command") == "move_player_back":
-                        npc = self.hr_npc if self.dialogue.current_npc == "HR" else self.ceo_npc
-                        self.move_player_away_from_npc(npc.pos)
-                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not self.dialogue.active:
-                        self.check_npc_interactions(manual_trigger=True)
-                    if event.type == pygame.MOUSEMOTION:
-                        self.player.update_rotation(event.rel[0])
+                    if event.type == pygame.QUIT:
+                        self.running = False
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_ESCAPE:
+                            pygame.mouse.set_visible(True)
+                            pygame.event.set_grab(False)
+                            self.running = False
 
+                        # Handle dialogue input and check for exit command
+                        if self.dialogue.active:
+                            result = await self.dialogue.handle_input(event)
+                            if isinstance(result, dict) and result.get("command") == "move_player_back":
+                                current_npc = self.hr_npc if self.dialogue.current_npc == "HR" else self.ceo_npc
+                                self.move_player_away_from_npc(current_npc.pos)
+
+                    elif event.type == pygame.MOUSEMOTION:
+                        x, y = event.rel
+                        self.player.update_rotation(x, y)
+
+                # Handle keyboard input for movement
                 if not self.dialogue.active:
                     keys = pygame.key.get_pressed()
-                    movement = {pygame.K_w: (0, -1), pygame.K_s: (0, 1), pygame.K_a: (-1, 0), pygame.K_d: (1, 0)}
-                    [self.player.move(*movement[k]) for k in movement if keys[k]]
+                    if keys[pygame.K_w]: self.player.move(0, -1)
+                    if keys[pygame.K_s]: self.player.move(0, 1)
+                    if keys[pygame.K_a]: self.player.move(-1, 0)
+                    if keys[pygame.K_d]: self.player.move(1, 0)
 
-                if not hasattr(self, 'manual_interaction_only') or not self.manual_interaction_only:
-                    if time.time() - self.last_interaction_time > 0.5:
-                        self.check_npc_interactions()
+                # Check NPC interactions
+                current_time = time.time()
+                if current_time - self.last_interaction_time > 0.5:
+                    dx = self.player.pos[0] - self.hr_npc.pos[0]
+                    dz = self.player.pos[2] - self.hr_npc.pos[2]
+                    hr_distance = math.sqrt(dx * dx + dz * dz)
 
+                    dx = self.player.pos[0] - self.ceo_npc.pos[0]
+                    dz = self.player.pos[2] - self.ceo_npc.pos[2]
+                    ceo_distance = math.sqrt(dx * dx + dz * dz)
+
+                    if hr_distance < self.interaction_distance and not self.dialogue.active:
+                        self.dialogue.start_conversation("HR", self.player.pos)
+                        self.last_interaction_time = current_time
+                    elif ceo_distance < self.interaction_distance and not self.dialogue.active:
+                        self.dialogue.start_conversation("CEO", self.player.pos)
+                        self.last_interaction_time = current_time
+
+                # Clear the screen and depth buffer
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+                # Save the current matrix
                 glPushMatrix()
+
+                # Apply player rotation and position
                 glRotatef(self.player.rot[0], 1, 0, 0)
                 glRotatef(self.player.rot[1], 0, 1, 0)
-                glTranslatef(*[-c for c in self.player.pos])
+                glTranslatef(-self.player.pos[0], -self.player.pos[1], -self.player.pos[2])
+
+                # Draw the world and NPCs
                 self.world.draw()
                 self.hr_npc.draw()
                 self.ceo_npc.draw()
+
+                # Restore the matrix
                 glPopMatrix()
+
+                # Render dialogue system
                 self.dialogue.render()
+
+                # Swap the buffers
                 pygame.display.flip()
+
+                # Maintain 60 FPS
                 pygame.time.Clock().tick(60)
+
+                # Allow other tasks to run
+                await asyncio.sleep(0)
 
         pygame.quit()
 
-    def check_npc_interactions(self, manual_trigger=False):
-        current_time = time.time()
-        if manual_trigger or (current_time - self.last_interaction_time > 0.5 and not self.dialogue.active):
-            if manual_trigger: print("Attempting interaction...")
-            for npc, name in [(self.hr_npc, "HR"), (self.ceo_npc, "CEO")]:
-                if self.calculate_distance(self.player.pos, npc.pos) < self.interaction_distance:
-                    self.dialogue.start_conversation(name, self.player.pos)
-                    self.last_interaction_time = current_time
-                    return
-            if manual_trigger: print("No NPC in range")
+    def run(self):
+        self.loop.run_until_complete(self.run_async())
 
-    def calculate_distance(self, pos1, pos2):
-        return math.sqrt((pos1[0] - pos2[0]) ** 2 + (pos1[2] - pos2[2]) ** 2)
 
 # Create and run game
-game = Game3D()
-game.run()
+async def main():
+    game = await Game3D().initialize()
+    await game.run_async()
 
+if __name__ == "__main__":
+    asyncio.run(main())
